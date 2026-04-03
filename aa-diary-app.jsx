@@ -384,6 +384,12 @@ function CoupleDiaryApp() {
     return <PairingScreen appState={appState} inviteCode={inviteCode} onCreatePair={handleCreatePair} onJoinPair={handleJoinPair} onCancelPair={handleCancelPair} theme={theme} nickname={nickname} onLogout={handleLogout} />;
   }
 
+  if (appState !== 'paired') {
+    // 未知状态兜底：清除 token 重回登录
+    removeAuthToken();
+    return <LoginScreen onLogin={handleLogin} onSwitchToRegister={() => setAppState('register')} theme={getTheme('girl')} />;
+  }
+
   return (
     <div style={{ height: '100dvh', width: '100%', display: 'flex', justifyContent: 'center', fontFamily: 'system-ui,sans-serif', overflow: 'hidden', background: theme.appBg }}>
       <div style={{ width: '100%', maxWidth: 448, height: '100%', position: 'relative', display: 'flex', flexDirection: 'column', background: 'rgba(255,255,255,0.4)', boxShadow: '0 25px 50px rgba(0,0,0,0.1)' }}>
