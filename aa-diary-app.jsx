@@ -21,25 +21,45 @@ function removeAuthToken() {
 // ======================== API 封装 ========================
 async function api(path, body = {}) {
   const token = getAuthToken();
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token, ...body }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || '请求失败');
-  return data;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, ...body }),
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '请求失败');
+    return data;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('请求超时，请检查网络连接');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function authApi(path, body = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || '请求失败');
-  return data;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '请求失败');
+    return data;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('请求超时，请检查网络连接');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }// ======================== 常量 ========================
 const MOOD_OPTIONS = [
   { value: 'happy', emoji: '🥰', label: '开心' },
@@ -273,7 +293,7 @@ export default function CoupleDiaryApp() {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'join_room', pairId: res.pairId }));
       }
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message); throw err; }
   };
 
   // 加入配对
@@ -628,8 +648,13 @@ function PairingScreen({ appState, inviteCode, onCreatePair, onJoinPair, onCance
   const handleCreate = async () => {
     if (!selectedRole) return;
     setLoading(true);
-    await onCreatePair(selectedRole);
-    setLoading(false);
+    try {
+      await onCreatePair(selectedRole);
+    } catch (e) {
+      // error already toasted by parent
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleJoin = async () => {
