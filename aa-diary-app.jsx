@@ -5,31 +5,42 @@ import { Calendar as CalendarIcon, Ticket, Plus, X, Stamp, ChevronLeft, ChevronR
 const API_BASE = 'http://localhost:3001/api';
 const WS_URL = 'ws://localhost:3001';
 
-// ======================== 设备标识 ========================
-function getDeviceToken() {
-  let token = null;
-  try { token = localStorage.getItem('aa_device_token'); } catch(e) {}
-  if (!token) {
-    token = 'dev_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    try { localStorage.setItem('aa_device_token', token); } catch(e) {}
-  }
-  return token;
+// ======================== Token 管理 ========================
+function getAuthToken() {
+  try { return localStorage.getItem('aa_auth_token'); } catch(e) { return null; }
+}
+
+function setAuthToken(token) {
+  try { localStorage.setItem('aa_auth_token', token); } catch(e) {}
+}
+
+function removeAuthToken() {
+  try { localStorage.removeItem('aa_auth_token'); } catch(e) {}
 }
 
 // ======================== API 封装 ========================
 async function api(path, body = {}) {
-  const deviceToken = getDeviceToken();
+  const token = getAuthToken();
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceToken, ...body }),
+    body: JSON.stringify({ token, ...body }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || '请求失败');
   return data;
 }
 
-// ======================== 常量 ========================
+async function authApi(path, body = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '请求失败');
+  return data;
+}// ======================== 常量 ========================
 const MOOD_OPTIONS = [
   { value: 'happy', emoji: '🥰', label: '开心' },
   { value: 'surprise', emoji: '🤩', label: '惊喜' },
@@ -53,11 +64,12 @@ const getTheme = (role) => {
 
 // ======================== 主应用 ========================
 export default function CoupleDiaryApp() {
-  const [appState, setAppState] = useState('loading'); // loading | unpaired | waiting | paired
+  const [appState, setAppState] = useState('loading'); // loading | login | register | unpaired | waiting | paired
   const [myRole, setMyRole] = useState(null);
   const [pairId, setPairId] = useState(null);
   const [inviteCode, setInviteCode] = useState('');
   const [userId, setUserId] = useState(null);
+  const [nickname, setNickname] = useState('');
 
   // 数据
   const [vouchers, setVouchers] = useState([]);
@@ -102,7 +114,8 @@ export default function CoupleDiaryApp() {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'auth', deviceToken: getDeviceToken() }));
+      const token = getAuthToken();
+      ws.send(JSON.stringify({ type: 'auth', token }));
       if (currentPairId) ws.send(JSON.stringify({ type: 'join_room', pairId: currentPairId }));
     };
 
@@ -167,8 +180,15 @@ export default function CoupleDiaryApp() {
   useEffect(() => {
     (async () => {
       try {
+        const token = getAuthToken();
+        if (!token) {
+          setAppState('login');
+          return;
+        }
+
         const res = await api('/auth');
         setUserId(res.user.id);
+        setNickname(res.user.nickname || '');
 
         if (res.status === 'paired') {
           setMyRole(res.user.role);
@@ -188,11 +208,58 @@ export default function CoupleDiaryApp() {
         }
       } catch (err) {
         console.error('Init error:', err);
-        setAppState('unpaired');
+        removeAuthToken();
+        setAppState('login');
       }
     })();
     return () => { wsRef.current?.close(); };
   }, [applyPairData, connectWS]);
+
+  // 登录处理
+  const handleLogin = async (username, password) => {
+    const res = await authApi('/login', { username, password });
+    setAuthToken(res.token);
+    setUserId(res.user.id);
+    setNickname(res.user.nickname);
+
+    if (res.status === 'paired') {
+      setMyRole(res.user.role);
+      setPairId(res.user.pairId);
+      applyPairData(res.data);
+      setAppState('paired');
+      connectWS(res.user.pairId);
+    } else if (res.status === 'waiting') {
+      setMyRole(res.user.role);
+      setPairId(res.user.pairId);
+      setInviteCode(res.inviteCode);
+      setAppState('waiting');
+      connectWS(res.user.pairId);
+    } else {
+      setAppState('unpaired');
+      connectWS(null);
+    }
+  };
+
+  // 注册处理
+  const handleRegister = async (username, password, nickname) => {
+    const res = await authApi('/register', { username, password, nickname });
+    setAuthToken(res.token);
+    setUserId(res.user.id);
+    setNickname(res.user.nickname);
+    setAppState('unpaired');
+    connectWS(null);
+  };
+
+  // 退出登录
+  const handleLogout = () => {
+    removeAuthToken();
+    setUserId(null);
+    setMyRole(null);
+    setPairId(null);
+    setNickname('');
+    setAppState('login');
+    wsRef.current?.close();
+  };
 
   // 创建配对
   const handleCreatePair = async (role) => {
@@ -247,17 +314,25 @@ export default function CoupleDiaryApp() {
   // ========== 渲染 ==========
   if (appState === 'loading') {
     return (
-      <div style={{ height: '100dvh', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme.appBg }}>
+      <div style={{ height: '100dvh', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#FFF5F7' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ width: 40, height: 40, border: `4px solid ${theme.mainColorLight}`, borderTopColor: theme.mainColor, borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 12px' }} />
+          <div style={{ width: 40, height: 40, border: '4px solid #fce7f3', borderTopColor: '#f472b6', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 12px' }} />
           <span style={{ fontSize: 13, fontWeight: 700, color: '#94a3b8' }}>日记本打开中...</span>
         </div>
       </div>
     );
   }
 
+  if (appState === 'login') {
+    return <LoginScreen onLogin={handleLogin} onSwitchToRegister={() => setAppState('register')} theme={getTheme('girl')} />;
+  }
+
+  if (appState === 'register') {
+    return <RegisterScreen onRegister={handleRegister} onSwitchToLogin={() => setAppState('login')} theme={getTheme('girl')} />;
+  }
+
   if (appState === 'unpaired' || appState === 'waiting') {
-    return <PairingScreen appState={appState} inviteCode={inviteCode} onCreatePair={handleCreatePair} onJoinPair={handleJoinPair} onCancelPair={handleCancelPair} theme={theme} />;
+    return <PairingScreen appState={appState} inviteCode={inviteCode} onCreatePair={handleCreatePair} onJoinPair={handleJoinPair} onCancelPair={handleCancelPair} theme={theme} nickname={nickname} onLogout={handleLogout} />;
   }
 
   return (
@@ -342,8 +417,192 @@ export default function CoupleDiaryApp() {
   );
 }
 
+// ======================== 登录页面 ========================
+function LoginScreen({ onLogin, onSwitchToRegister, theme }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!username || !password) {
+      setError('请输入用户名和密码');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await onLogin(username, password);
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ height: '100dvh', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme.appBg, padding: 16 }}>
+      <div style={{ width: '100%', maxWidth: 400, background: 'white', borderRadius: 40, boxShadow: '0 20px 60px rgba(0,0,0,0.1)', padding: 40, textAlign: 'center' }}>
+        <div style={{ fontSize: 56, marginBottom: 8 }}>💕</div>
+        <h2 style={{ fontSize: 26, fontWeight: 900, color: '#334155', margin: '0 0 8px' }}>AA日记</h2>
+        <p style={{ fontSize: 14, color: '#94a3b8', marginBottom: 32, lineHeight: 1.6 }}>专属于你们两个人的私密空间</p>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 16 }}>
+            <input
+              type="text"
+              placeholder="用户名"
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              style={{ width: '100%', padding: '16px 20px', borderRadius: 16, border: '2px solid #f1f5f9', fontSize: 15, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box', transition: 'all 0.2s' }}
+            />
+          </div>
+          <div style={{ marginBottom: 24 }}>
+            <input
+              type="password"
+              placeholder="密码"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              style={{ width: '100%', padding: '16px 20px', borderRadius: 16, border: '2px solid #f1f5f9', fontSize: 15, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box', transition: 'all 0.2s' }}
+            />
+          </div>
+
+          {error && (
+            <div style={{ marginBottom: 16, padding: '12px 16px', background: '#fef2f2', borderRadius: 12, border: '2px solid #fecaca' }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: '#ef4444' }}>{error}</span>
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            style={{ width: '100%', padding: '16px 0', borderRadius: 16, border: 'none', cursor: loading ? 'not-allowed' : 'pointer', fontSize: 15, fontWeight: 900, color: 'white', background: loading ? '#f3f4f6' : `linear-gradient(135deg, ${theme.fabFrom}, ${theme.fabTo})`, boxShadow: loading ? 'none' : '0 8px 20px rgba(0,0,0,0.12)', marginBottom: 20 }}
+          >
+            {loading ? '登录中...' : '登录'}
+          </button>
+        </form>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          <span style={{ fontSize: 13, color: '#94a3b8' }}>还没有账号？</span>
+          <button onClick={onSwitchToRegister} style={{ fontSize: 13, fontWeight: 700, color: theme.mainColor, background: 'none', border: 'none', cursor: 'pointer' }}>
+            立即注册
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ======================== 注册页面 ========================
+function RegisterScreen({ onRegister, onSwitchToLogin, theme }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [nickname, setNickname] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!username || !password) {
+      setError('请输入用户名和密码');
+      return;
+    }
+    if (username.length < 3) {
+      setError('用户名至少3个字符');
+      return;
+    }
+    if (password.length < 6) {
+      setError('密码至少6位');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError('两次输入的密码不一致');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await onRegister(username, password, nickname || username);
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ height: '100dvh', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme.appBg, padding: 16 }}>
+      <div style={{ width: '100%', maxWidth: 400, background: 'white', borderRadius: 40, boxShadow: '0 20px 60px rgba(0,0,0,0.1)', padding: 40, textAlign: 'center' }}>
+        <div style={{ fontSize: 48, marginBottom: 8 }}>✨</div>
+        <h2 style={{ fontSize: 26, fontWeight: 900, color: '#334155', margin: '0 0 8px' }}>创建账号</h2>
+        <p style={{ fontSize: 14, color: '#94a3b8', marginBottom: 32, lineHeight: 1.6 }}>开始你们的甜蜜日记</p>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 12 }}>
+            <input
+              type="text"
+              placeholder="用户名（至少3个字符）"
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              style={{ width: '100%', padding: '14px 18px', borderRadius: 14, border: '2px solid #f1f5f9', fontSize: 14, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box' }}
+            />
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <input
+              type="text"
+              placeholder="昵称（可选）"
+              value={nickname}
+              onChange={e => setNickname(e.target.value)}
+              style={{ width: '100%', padding: '14px 18px', borderRadius: 14, border: '2px solid #f1f5f9', fontSize: 14, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box' }}
+            />
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <input
+              type="password"
+              placeholder="密码（至少6位）"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              style={{ width: '100%', padding: '14px 18px', borderRadius: 14, border: '2px solid #f1f5f9', fontSize: 14, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box' }}
+            />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <input
+              type="password"
+              placeholder="确认密码"
+              value={confirmPassword}
+              onChange={e => setConfirmPassword(e.target.value)}
+              style={{ width: '100%', padding: '14px 18px', borderRadius: 14, border: '2px solid #f1f5f9', fontSize: 14, fontWeight: 600, color: '#334155', outline: 'none', background: '#f8fafc', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          {error && (
+            <div style={{ marginBottom: 16, padding: '12px 16px', background: '#fef2f2', borderRadius: 12, border: '2px solid #fecaca' }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: '#ef4444' }}>{error}</span>
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            style={{ width: '100%', padding: '16px 0', borderRadius: 16, border: 'none', cursor: loading ? 'not-allowed' : 'pointer', fontSize: 15, fontWeight: 900, color: 'white', background: loading ? '#f3f4f6' : `linear-gradient(135deg, ${theme.fabFrom}, ${theme.fabTo})`, boxShadow: loading ? 'none' : '0 8px 20px rgba(0,0,0,0.12)', marginBottom: 20 }}
+          >
+            {loading ? '注册中...' : '注册'}
+          </button>
+        </form>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          <span style={{ fontSize: 13, color: '#94a3b8' }}>已有账号？</span>
+          <button onClick={onSwitchToLogin} style={{ fontSize: 13, fontWeight: 700, color: theme.mainColor, background: 'none', border: 'none', cursor: 'pointer' }}>
+            立即登录
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ======================== 配对页面 ========================
-function PairingScreen({ appState, inviteCode, onCreatePair, onJoinPair, onCancelPair, theme }) {
+function PairingScreen({ appState, inviteCode, onCreatePair, onJoinPair, onCancelPair, theme, nickname, onLogout }) {
   const [tab, setTab] = useState('create'); // create | join
   const [selectedRole, setSelectedRole] = useState(null);
   const [inputCode, setInputCode] = useState('');
@@ -418,9 +677,15 @@ function PairingScreen({ appState, inviteCode, onCreatePair, onJoinPair, onCance
   return (
     <div style={{ height: '100dvh', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme.appBg, padding: 16 }}>
       <div style={{ width: '100%', maxWidth: 400, background: 'white', borderRadius: 40, boxShadow: '0 20px 60px rgba(0,0,0,0.1)', padding: 32, textAlign: 'center' }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: -20 }}>
+          <button onClick={onLogout} style={{ padding: '6px 12px', borderRadius: 999, border: '2px solid #e2e8f0', background: 'white', color: '#94a3b8', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+            退出登录
+          </button>
+        </div>
         <div style={{ fontSize: 48, marginBottom: 8 }}>💕</div>
         <h2 style={{ fontSize: 22, fontWeight: 900, color: '#334155', margin: '0 0 8px' }}>AA日记</h2>
-        <p style={{ fontSize: 13, color: '#94a3b8', marginBottom: 24, lineHeight: 1.6 }}>专属于你们两个人的私密空间</p>
+        <p style={{ fontSize: 13, color: '#94a3b8', marginBottom: 8, lineHeight: 1.6 }}>专属于你们两个人的私密空间</p>
+        {nickname && <p style={{ fontSize: 14, fontWeight: 700, color: theme.mainColor, marginBottom: 16 }}>你好，{nickname} 👋</p>}
 
         {/* Tab 切换 */}
         <div style={{ display: 'flex', background: '#f8fafc', borderRadius: 16, padding: 4, marginBottom: 24 }}>

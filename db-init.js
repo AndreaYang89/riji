@@ -23,14 +23,16 @@ async function init() {
   await conn.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(36) PRIMARY KEY,
-      device_token VARCHAR(64) UNIQUE NOT NULL COMMENT '设备标识，首次访问自动生成',
+      username VARCHAR(32) UNIQUE NOT NULL COMMENT '登录账号',
+      password_hash VARCHAR(255) NOT NULL COMMENT '密码哈希',
+      nickname VARCHAR(32) DEFAULT NULL COMMENT '用户昵称',
       role ENUM('girl','boy') DEFAULT NULL COMMENT '角色选择',
       pair_id VARCHAR(36) DEFAULT NULL COMMENT '所属配对关系ID',
       mood VARCHAR(20) DEFAULT 'happy',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_pair (pair_id),
-      INDEX idx_token (device_token)
+      INDEX idx_username (username)
     ) ENGINE=InnoDB
   `);
 

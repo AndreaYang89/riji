@@ -8,6 +8,10 @@ const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const mysql = require('mysql2/promise');
 const { v4: uuid } = require('uuid');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'aa-diary-secret-key-change-in-production';
 
 // ======================== 配置 ========================
 const PORT = process.env.PORT || 3001;
@@ -19,7 +23,7 @@ const DB_CONFIG = {
   database: process.env.DB_NAME || 'aa_diary',
   waitForConnections: true,
   connectionLimit: 10,
-  dateStrings: true,  // 所有日期类型都返回字符串，避免时区转换问题
+  dateStrings: true,
 };
 
 // ======================== 初始化 ========================
@@ -36,7 +40,6 @@ const pairConnections = new Map();
 
 // ======================== 工具方法 ========================
 function genInviteCode() {
-  // 6位数字配对码，避免歧义字符
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
@@ -52,13 +55,30 @@ function broadcastToPair(pairId, event, data, excludeUserId = null) {
   }
 }
 
-/** 通过 device_token 获取或创建用户 */
-async function getOrCreateUser(deviceToken) {
-  const [rows] = await pool.execute('SELECT * FROM users WHERE device_token = ?', [deviceToken]);
-  if (rows.length > 0) return rows[0];
-  const id = uuid();
-  await pool.execute('INSERT INTO users (id, device_token) VALUES (?, ?)', [id, deviceToken]);
-  return { id, device_token: deviceToken, role: null, pair_id: null, mood: 'happy' };
+/** 通过用户ID获取用户 */
+async function getUserById(userId) {
+  const [rows] = await pool.execute('SELECT * FROM users WHERE id = ?', [userId]);
+  return rows[0] || null;
+}
+
+/** 通过用户名获取用户 */
+async function getUserByUsername(username) {
+  const [rows] = await pool.execute('SELECT * FROM users WHERE username = ?', [username]);
+  return rows[0] || null;
+}
+
+/** 验证 JWT Token */
+function verifyToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+/** 生成 JWT Token */
+function generateToken(userId) {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 /** 加载配对关系下的所有数据 */
@@ -82,8 +102,6 @@ async function loadPairData(pairId) {
   const [pair] = await pool.execute('SELECT anniversary FROM pairs WHERE id = ?', [pairId]);
   const [users] = await pool.execute('SELECT role, mood FROM users WHERE pair_id = ?', [pairId]);
 
-  // 组装日记数据为 { "2026-03-27": { girl: {...}, boy: {...} } }
-  // dateStrings:true 确保 MySQL DATE 返回 "2026-03-27" 字符串
   const diaryData = {};
   for (const d of diaries) {
     const dateStr = typeof d.diary_date === 'string' ? d.diary_date.slice(0, 10) : d.diary_date;
@@ -91,7 +109,6 @@ async function loadPairData(pairId) {
     diaryData[dateStr][d.role] = { text: d.content, updatedAt: new Date(d.updated_at).getTime() };
   }
 
-  // 组装心情
   const moods = { girl: 'happy', boy: 'happy' };
   for (const u of users) {
     if (u.role) moods[u.role] = u.mood || 'happy';
@@ -113,37 +130,37 @@ async function loadPairData(pairId) {
 
 /**
  * POST /api/auth
- * Body: { deviceToken: string }
- * 用设备标识登录/注册，返回用户信息和配对状态
+ * Body: { token: string }
  */
 app.post('/api/auth', async (req, res) => {
   try {
-    const { deviceToken } = req.body;
-    if (!deviceToken) return res.status(400).json({ error: '缺少 deviceToken' });
+    const { token } = req.body;
+    if (!token) return res.status(401).json({ error: '未登录' });
 
-    const user = await getOrCreateUser(deviceToken);
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
 
-    // 如果已配对，返回完整数据
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
+
     if (user.pair_id) {
       const [pair] = await pool.execute('SELECT * FROM pairs WHERE id = ?', [user.pair_id]);
       if (pair.length > 0 && pair[0].status === 'paired') {
         const pairData = await loadPairData(user.pair_id);
         return res.json({
           status: 'paired',
-          user: { id: user.id, role: user.role, pairId: user.pair_id },
+          user: { id: user.id, role: user.role, pairId: user.pair_id, nickname: user.nickname },
           data: pairData,
         });
       }
-      // waiting 状态
       return res.json({
         status: 'waiting',
-        user: { id: user.id, role: user.role, pairId: user.pair_id },
+        user: { id: user.id, role: user.role, pairId: user.pair_id, nickname: user.nickname },
         inviteCode: pair[0]?.invite_code,
       });
     }
 
-    // 未配对
-    return res.json({ status: 'unpaired', user: { id: user.id, role: null, pairId: null } });
+    return res.json({ status: 'unpaired', user: { id: user.id, role: null, pairId: null, nickname: user.nickname } });
   } catch (err) {
     console.error('auth error:', err);
     res.status(500).json({ error: '服务器错误' });
@@ -151,25 +168,133 @@ app.post('/api/auth', async (req, res) => {
 });
 
 /**
+ * POST /api/register
+ * Body: { username, password, nickname? }
+ */
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password, nickname } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: '用户名和密码不能为空' });
+    }
+
+    if (username.length < 3 || username.length > 32) {
+      return res.status(400).json({ error: '用户名长度需在3-32个字符之间' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: '密码长度至少6位' });
+    }
+
+    const existingUser = await getUserByUsername(username);
+    if (existingUser) {
+      return res.status(409).json({ error: '用户名已被注册' });
+    }
+
+    const id = uuid();
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userNickname = nickname || username;
+
+    await pool.execute(
+      'INSERT INTO users (id, username, password_hash, nickname) VALUES (?, ?, ?, ?)',
+      [id, username, passwordHash, userNickname]
+    );
+
+    const token = generateToken(id);
+
+    res.json({
+      success: true,
+      message: '注册成功',
+      token,
+      user: { id, username, nickname: userNickname, role: null, pairId: null }
+    });
+  } catch (err) {
+    console.error('register error:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
+/**
+ * POST /api/login
+ * Body: { username, password }
+ */
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: '用户名和密码不能为空' });
+    }
+
+    const user = await getUserByUsername(username);
+    if (!user) {
+      return res.status(401).json({ error: '用户名或密码错误' });
+    }
+
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: '用户名或密码错误' });
+    }
+
+    const token = generateToken(user.id);
+
+    const response = {
+      success: true,
+      message: '登录成功',
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        nickname: user.nickname,
+        role: user.role,
+        pairId: user.pair_id
+      }
+    };
+
+    if (user.pair_id) {
+      const [pair] = await pool.execute('SELECT * FROM pairs WHERE id = ?', [user.pair_id]);
+      if (pair.length > 0) {
+        if (pair[0].status === 'paired') {
+          const pairData = await loadPairData(user.pair_id);
+          response.status = 'paired';
+          response.data = pairData;
+        } else {
+          response.status = 'waiting';
+          response.inviteCode = pair[0].invite_code;
+        }
+      }
+    } else {
+      response.status = 'unpaired';
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error('login error:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
+/**
  * POST /api/pair/create
- * Body: { deviceToken: string, role: 'girl'|'boy' }
- * 创建配对，生成6位邀请码
  */
 app.post('/api/pair/create', async (req, res) => {
   try {
-    const { deviceToken, role } = req.body;
-    if (!deviceToken || !role) return res.status(400).json({ error: '缺少参数' });
+    const { token, role } = req.body;
+    if (!token || !role) return res.status(400).json({ error: '缺少参数' });
 
-    const user = await getOrCreateUser(deviceToken);
-    
-    // 如果已有配对关系，检查是否可取消
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
+
     if (user.pair_id) {
       const [existingPairs] = await pool.execute(
         'SELECT * FROM pairs WHERE id = ? AND status = "waiting"',
         [user.pair_id]
       );
       if (existingPairs.length > 0) {
-        // 自动取消旧的等待中配对
         await pool.execute('DELETE FROM pairs WHERE id = ?', [user.pair_id]);
         await pool.execute('UPDATE users SET pair_id = NULL, role = NULL WHERE id = ?', [user.id]);
       } else {
@@ -177,7 +302,6 @@ app.post('/api/pair/create', async (req, res) => {
       }
     }
 
-    // 生成唯一的邀请码（重试最多5次）
     let code;
     for (let i = 0; i < 5; i++) {
       code = genInviteCode();
@@ -202,18 +326,19 @@ app.post('/api/pair/create', async (req, res) => {
 
 /**
  * POST /api/pair/join
- * Body: { deviceToken: string, inviteCode: string, role: 'girl'|'boy' }
- * 通过邀请码加入配对
  */
 app.post('/api/pair/join', async (req, res) => {
   try {
-    const { deviceToken, inviteCode, role } = req.body;
-    if (!deviceToken || !inviteCode || !role) return res.status(400).json({ error: '缺少参数' });
+    const { token, inviteCode, role } = req.body;
+    if (!token || !inviteCode || !role) return res.status(400).json({ error: '缺少参数' });
 
-    const user = await getOrCreateUser(deviceToken);
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (user.pair_id) return res.status(400).json({ error: '你已在配对中' });
 
-    // 查找等待中的配对
     const [pairs] = await pool.execute(
       'SELECT * FROM pairs WHERE invite_code = ? AND status = "waiting"',
       [inviteCode]
@@ -223,11 +348,9 @@ app.post('/api/pair/join', async (req, res) => {
     const pair = pairs[0];
     if (pair.user_a_id === user.id) return res.status(400).json({ error: '不能和自己配对哦' });
 
-    // 检查角色是否冲突
     const [userA] = await pool.execute('SELECT role FROM users WHERE id = ?', [pair.user_a_id]);
     if (userA[0]?.role === role) return res.status(400).json({ error: `对方已选择了${role === 'girl' ? '女生' : '男生'}，请选另一个角色` });
 
-    // 完成配对
     await pool.execute(
       'UPDATE pairs SET user_b_id = ?, status = "paired", anniversary = CURDATE() WHERE id = ?',
       [user.id, pair.id]
@@ -235,8 +358,6 @@ app.post('/api/pair/join', async (req, res) => {
     await pool.execute('UPDATE users SET role = ?, pair_id = ? WHERE id = ?', [role, pair.id, user.id]);
 
     const pairData = await loadPairData(pair.id);
-
-    // 通知发起方：配对成功
     broadcastToPair(pair.id, 'pair:completed', { pairData });
 
     res.json({ status: 'paired', pairId: pair.id, role, data: pairData });
@@ -248,25 +369,25 @@ app.post('/api/pair/join', async (req, res) => {
 
 /**
  * POST /api/pair/cancel
- * Body: { deviceToken: string }
- * 取消等待中的配对，回到未配对状态
  */
 app.post('/api/pair/cancel', async (req, res) => {
   try {
-    const { deviceToken } = req.body;
-    if (!deviceToken) return res.status(400).json({ error: '缺少参数' });
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: '缺少参数' });
 
-    const user = await getOrCreateUser(deviceToken);
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(400).json({ error: '当前没有配对' });
 
-    // 只能取消 waiting 状态的配对
     const [pairs] = await pool.execute(
       'SELECT * FROM pairs WHERE id = ? AND status = "waiting"',
       [user.pair_id]
     );
     if (pairs.length === 0) return res.status(400).json({ error: '配对已完成，无法取消' });
 
-    // 删除配对记录，重置用户状态
     await pool.execute('DELETE FROM pairs WHERE id = ?', [user.pair_id]);
     await pool.execute('UPDATE users SET pair_id = NULL, role = NULL WHERE id = ?', [user.id]);
 
@@ -279,12 +400,15 @@ app.post('/api/pair/cancel', async (req, res) => {
 
 /**
  * POST /api/diary/save
- * Body: { deviceToken, date, content }
  */
 app.post('/api/diary/save', async (req, res) => {
   try {
-    const { deviceToken, date, content } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, date, content } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     const id = uuid();
@@ -305,12 +429,15 @@ app.post('/api/diary/save', async (req, res) => {
 
 /**
  * POST /api/voucher/create
- * Body: { deviceToken, reason }
  */
 app.post('/api/voucher/create', async (req, res) => {
   try {
-    const { deviceToken, reason } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, reason } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     const id = uuid();
@@ -330,15 +457,17 @@ app.post('/api/voucher/create', async (req, res) => {
 
 /**
  * POST /api/voucher/update
- * Body: { deviceToken, voucherId, status }
  */
 app.post('/api/voucher/update', async (req, res) => {
   try {
-    const { deviceToken, voucherId, status } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, voucherId, status } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
-    // 检查券当前状态，已撤回的不允许操作
     const [rows] = await pool.execute('SELECT status FROM vouchers WHERE id = ? AND pair_id = ?', [voucherId, user.pair_id]);
     if (rows.length === 0) return res.status(404).json({ error: '券不存在' });
     if (rows[0].status === 'revoked') return res.status(400).json({ error: '该券已被撤回，无法操作' });
@@ -354,18 +483,19 @@ app.post('/api/voucher/update', async (req, res) => {
 
 /**
  * POST /api/voucher/revoke
- * Body: { deviceToken, voucherId }
- * 撤回已发放的免死金牌（仅发放者可撤回，且仅限 available 状态）
  */
 app.post('/api/voucher/revoke', async (req, res) => {
   try {
-    const { deviceToken, voucherId } = req.body;
-    if (!deviceToken || !voucherId) return res.status(400).json({ error: '缺少参数' });
+    const { token, voucherId } = req.body;
+    if (!token || !voucherId) return res.status(400).json({ error: '缺少参数' });
 
-    const user = await getOrCreateUser(deviceToken);
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
-    // 查找券，确认是本人发放且状态为 available
     const [rows] = await pool.execute(
       'SELECT * FROM vouchers WHERE id = ? AND pair_id = ?',
       [voucherId, user.pair_id]
@@ -380,12 +510,7 @@ app.post('/api/voucher/revoke', async (req, res) => {
       return res.status(400).json({ error: '该券已被使用或正在审批中，无法撤回' });
     }
 
-    // 更新状态为 revoked
-    await pool.execute(
-      'UPDATE vouchers SET status = "revoked" WHERE id = ?',
-      [voucherId]
-    );
-
+    await pool.execute('UPDATE vouchers SET status = "revoked" WHERE id = ?', [voucherId]);
     broadcastToPair(user.pair_id, 'voucher:revoked', { id: voucherId }, user.id);
     res.json({ success: true });
   } catch (err) {
@@ -396,12 +521,15 @@ app.post('/api/voucher/revoke', async (req, res) => {
 
 /**
  * POST /api/wish/create
- * Body: { deviceToken, content }
  */
 app.post('/api/wish/create', async (req, res) => {
   try {
-    const { deviceToken, content } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, content } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     const id = uuid();
@@ -421,12 +549,15 @@ app.post('/api/wish/create', async (req, res) => {
 
 /**
  * POST /api/wish/toggle
- * Body: { deviceToken, wishId }
  */
 app.post('/api/wish/toggle', async (req, res) => {
   try {
-    const { deviceToken, wishId } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, wishId } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     await pool.execute('UPDATE wishes SET completed = NOT completed WHERE id = ? AND pair_id = ?', [wishId, user.pair_id]);
@@ -441,12 +572,15 @@ app.post('/api/wish/toggle', async (req, res) => {
 
 /**
  * POST /api/wish/delete
- * Body: { deviceToken, wishId }
  */
 app.post('/api/wish/delete', async (req, res) => {
   try {
-    const { deviceToken, wishId } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, wishId } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     await pool.execute('DELETE FROM wishes WHERE id = ? AND pair_id = ?', [wishId, user.pair_id]);
@@ -460,12 +594,15 @@ app.post('/api/wish/delete', async (req, res) => {
 
 /**
  * POST /api/countdown/create
- * Body: { deviceToken, title, date }
  */
 app.post('/api/countdown/create', async (req, res) => {
   try {
-    const { deviceToken, title, date } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, title, date } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     const id = uuid();
@@ -485,12 +622,15 @@ app.post('/api/countdown/create', async (req, res) => {
 
 /**
  * POST /api/mood/update
- * Body: { deviceToken, mood }
  */
 app.post('/api/mood/update', async (req, res) => {
   try {
-    const { deviceToken, mood } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, mood } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     await pool.execute('UPDATE users SET mood = ? WHERE id = ?', [mood, user.id]);
@@ -504,12 +644,15 @@ app.post('/api/mood/update', async (req, res) => {
 
 /**
  * POST /api/anniversary/update
- * Body: { deviceToken, date }
  */
 app.post('/api/anniversary/update', async (req, res) => {
   try {
-    const { deviceToken, date } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token, date } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
     await pool.execute('UPDATE pairs SET anniversary = ? WHERE id = ?', [date, user.pair_id]);
@@ -523,15 +666,17 @@ app.post('/api/anniversary/update', async (req, res) => {
 
 /**
  * POST /api/comfort
- * Body: { deviceToken }
  */
 app.post('/api/comfort', async (req, res) => {
   try {
-    const { deviceToken } = req.body;
-    const user = await getOrCreateUser(deviceToken);
+    const { token } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
     if (!user.pair_id) return res.status(403).json({ error: '未配对' });
 
-    // 广播给对方（排除自己）
     const clients = pairConnections.get(user.pair_id);
     if (clients) {
       const msg = JSON.stringify({ event: 'comfort:received', data: { fromRole: user.role }, timestamp: Date.now() });
@@ -559,12 +704,22 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(raw);
 
-      // 客户端连上后发送 { type: 'auth', deviceToken: '...' }
       if (msg.type === 'auth') {
-        const user = await getOrCreateUser(msg.deviceToken);
+        const decoded = verifyToken(msg.token);
+        if (!decoded) {
+          ws.send(JSON.stringify({ event: 'auth:error', data: { message: '登录已过期' } }));
+          return;
+        }
+
+        const user = await getUserById(decoded.userId);
+        if (!user) {
+          ws.send(JSON.stringify({ event: 'auth:error', data: { message: '用户不存在' } }));
+          return;
+        }
+
         ws._userId = user.id;
         ws._pairId = user.pair_id;
-        ws._deviceToken = msg.deviceToken;
+        ws._token = msg.token;
 
         if (user.pair_id) {
           if (!pairConnections.has(user.pair_id)) {
@@ -578,7 +733,6 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      // 配对成功后重新加入房间
       if (msg.type === 'join_room' && msg.pairId) {
         ws._pairId = msg.pairId;
         if (!pairConnections.has(msg.pairId)) {
@@ -594,7 +748,6 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    // 从房间中移除
     if (ws._pairId && pairConnections.has(ws._pairId)) {
       pairConnections.get(ws._pairId).delete(ws);
       if (pairConnections.get(ws._pairId).size === 0) {
@@ -605,7 +758,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// 心跳检测，清理失活连接
+// 心跳检测
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
