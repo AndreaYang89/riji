@@ -693,6 +693,32 @@ app.post('/api/comfort', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/debug/reset-pair
+ * 重置当前用户的配对状态（开发调试用）
+ * Body: { token }
+ */
+app.post('/api/debug/reset-pair', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: '缺少token' });
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
+
+    if (user.pair_id) {
+      // 如果是 waiting 状态的pair，直接删除
+      await pool.execute('DELETE FROM pairs WHERE id = ? AND status = "waiting"', [user.pair_id]);
+    }
+    await pool.execute('UPDATE users SET pair_id = NULL, role = NULL WHERE id = ?', [user.id]);
+    res.json({ success: true, message: '配对状态已重置，请重新登录' });
+  } catch (err) {
+    console.error('debug/reset-pair error:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
 // ======================== WebSocket ========================
 wss.on('connection', (ws, req) => {
   console.log('🔌 WebSocket 新连接');

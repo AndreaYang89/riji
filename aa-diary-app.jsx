@@ -82,8 +82,37 @@ const getTheme = (role) => {
   };
 };
 
+// ======================== 错误边界 ========================
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ height: '100dvh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#FFF5F7', padding: 24 }}>
+          <div style={{ maxWidth: 360, textAlign: 'center', background: 'white', borderRadius: 24, padding: 32, boxShadow: '0 8px 32px rgba(0,0,0,0.08)' }}>
+            <div style={{ fontSize: 48, marginBottom: 12 }}>😵</div>
+            <h3 style={{ fontSize: 18, fontWeight: 900, color: '#334155', marginBottom: 8 }}>出了点小问题</h3>
+            <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8, wordBreak: 'break-all' }}>{this.state.error?.message}</p>
+            <button onClick={() => { localStorage.removeItem('aa_auth_token'); window.location.reload(); }}
+              style={{ marginTop: 16, padding: '12px 28px', borderRadius: 999, border: 'none', background: '#f472b6', color: 'white', fontWeight: 800, cursor: 'pointer', fontSize: 14 }}>
+              清除登录状态并刷新
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ======================== 主应用 ========================
-export default function CoupleDiaryApp() {
+function CoupleDiaryApp() {
   const [appState, setAppState] = useState('loading'); // loading | login | register | unpaired | waiting | paired
   const [myRole, setMyRole] = useState(null);
   const [pairId, setPairId] = useState(null);
@@ -239,21 +268,21 @@ export default function CoupleDiaryApp() {
   const handleLogin = async (username, password) => {
     const res = await authApi('/login', { username, password });
     setAuthToken(res.token);
-    setUserId(res.user.id);
-    setNickname(res.user.nickname);
+    setUserId(res.user?.id);
+    setNickname(res.user?.nickname || '');
 
     if (res.status === 'paired') {
-      setMyRole(res.user.role);
-      setPairId(res.user.pairId);
-      applyPairData(res.data);
+      setMyRole(res.user?.role || null);
+      setPairId(res.user?.pairId || null);
+      if (res.data) applyPairData(res.data);
       setAppState('paired');
-      connectWS(res.user.pairId);
+      connectWS(res.user?.pairId);
     } else if (res.status === 'waiting') {
-      setMyRole(res.user.role);
-      setPairId(res.user.pairId);
-      setInviteCode(res.inviteCode);
+      setMyRole(res.user?.role || null);
+      setPairId(res.user?.pairId || null);
+      setInviteCode(res.inviteCode || '');
       setAppState('waiting');
-      connectWS(res.user.pairId);
+      connectWS(res.user?.pairId);
     } else {
       setAppState('unpaired');
       connectWS(null);
@@ -264,8 +293,8 @@ export default function CoupleDiaryApp() {
   const handleRegister = async (username, password, nickname) => {
     const res = await authApi('/register', { username, password, nickname });
     setAuthToken(res.token);
-    setUserId(res.user.id);
-    setNickname(res.user.nickname);
+    setUserId(res.user?.id);
+    setNickname(res.user?.nickname || '');
     setAppState('unpaired');
     connectWS(null);
   };
@@ -1269,4 +1298,8 @@ function VoucherCard({ voucher, myRole, theme, onUpdateStatus, onRevoke }) {
       </div>
     </div>
   );
+}
+
+export default function App() {
+  return <ErrorBoundary><CoupleDiaryApp /></ErrorBoundary>;
 }
