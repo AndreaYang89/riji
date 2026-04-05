@@ -18,6 +18,14 @@ function removeAuthToken() {
   try { localStorage.removeItem('aa_auth_token'); } catch(e) {}
 }
 
+function toTime(value) {
+  return new Date(value).getTime();
+}
+
+function sortByDateAsc(items) {
+  return [...items].sort((a, b) => toTime(a.date) - toTime(b.date));
+}
+
 // ======================== API 封装 ========================
 async function api(path, body = {}) {
   const token = getAuthToken();
@@ -112,6 +120,7 @@ export default function CoupleDiaryApp() {
   const [showToast, setShowToast] = useState(false);
 
   const wsRef = useRef(null);
+  const latestPairIdRef = useRef(null);
   const theme = getTheme(myRole || 'girl');
 
   const toast = (msg) => { setToastMsg(msg); setShowToast(true); setTimeout(() => setShowToast(false), 2000); };
@@ -136,7 +145,8 @@ export default function CoupleDiaryApp() {
     ws.onopen = () => {
       const token = getAuthToken();
       ws.send(JSON.stringify({ type: 'auth', token }));
-      if (currentPairId) ws.send(JSON.stringify({ type: 'join_room', pairId: currentPairId }));
+      const roomPairId = latestPairIdRef.current || currentPairId;
+      if (roomPairId) ws.send(JSON.stringify({ type: 'join_room', pairId: roomPairId }));
     };
 
     ws.onmessage = (e) => {
@@ -176,7 +186,7 @@ export default function CoupleDiaryApp() {
             setWishlist(prev => prev.filter(w => w.id !== data.id));
             break;
           case 'countdown:created':
-            setCountdowns(prev => [...prev, data].sort((a, b) => new Date(a.date) - new Date(b.date)));
+            setCountdowns(prev => sortByDateAsc([...prev, data]));
             break;
           case 'mood:updated':
             setMoods(prev => ({ ...prev, [data.role]: data.mood }));
@@ -213,16 +223,19 @@ export default function CoupleDiaryApp() {
         if (res.status === 'paired') {
           setMyRole(res.user.role);
           setPairId(res.user.pairId);
+          latestPairIdRef.current = res.user.pairId;
           applyPairData(res.data);
           setAppState('paired');
           connectWS(res.user.pairId);
         } else if (res.status === 'waiting') {
           setMyRole(res.user.role);
           setPairId(res.user.pairId);
+          latestPairIdRef.current = res.user.pairId;
           setInviteCode(res.inviteCode);
           setAppState('waiting');
           connectWS(res.user.pairId);
         } else {
+          latestPairIdRef.current = null;
           setAppState('unpaired');
           connectWS(null);
         }
@@ -245,16 +258,19 @@ export default function CoupleDiaryApp() {
     if (res.status === 'paired') {
       setMyRole(res.user?.role || null);
       setPairId(res.user?.pairId || null);
+      latestPairIdRef.current = res.user?.pairId || null;
       if (res.data) applyPairData(res.data);
       setAppState('paired');
       connectWS(res.user?.pairId);
     } else if (res.status === 'waiting') {
       setMyRole(res.user?.role || null);
       setPairId(res.user?.pairId || null);
+      latestPairIdRef.current = res.user?.pairId || null;
       setInviteCode(res.inviteCode || '');
       setAppState('waiting');
       connectWS(res.user?.pairId);
     } else {
+      latestPairIdRef.current = null;
       setAppState('unpaired');
       connectWS(null);
     }
@@ -266,6 +282,7 @@ export default function CoupleDiaryApp() {
     setAuthToken(res.token);
     setUserId(res.user?.id);
     setNickname(res.user?.nickname || '');
+    latestPairIdRef.current = null;
     setAppState('unpaired');
     connectWS(null);
   };
@@ -276,6 +293,7 @@ export default function CoupleDiaryApp() {
     setUserId(null);
     setMyRole(null);
     setPairId(null);
+    latestPairIdRef.current = null;
     setNickname('');
     setAppState('login');
     wsRef.current?.close();
@@ -287,6 +305,7 @@ export default function CoupleDiaryApp() {
       const res = await api('/pair/create', { role });
       setMyRole(role);
       setPairId(res.pairId);
+      latestPairIdRef.current = res.pairId;
       setInviteCode(res.inviteCode);
       setAppState('waiting');
       // 加入 WS 房间
@@ -302,6 +321,7 @@ export default function CoupleDiaryApp() {
       const res = await api('/pair/join', { inviteCode: code, role });
       setMyRole(role);
       setPairId(res.pairId);
+      latestPairIdRef.current = res.pairId;
       applyPairData(res.data);
       setAppState('paired');
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -317,6 +337,7 @@ export default function CoupleDiaryApp() {
       await api('/pair/cancel');
       setMyRole(null);
       setPairId(null);
+      latestPairIdRef.current = null;
       setInviteCode('');
       setAppState('unpaired');
     } catch (err) { toast(err.message); }
@@ -425,7 +446,7 @@ export default function CoupleDiaryApp() {
         )}
         {showCountdownModal && (
           <ModalWrapper onClose={() => setShowCountdownModal(false)} title="添加专属倒数日 ⏰" theme={theme}>
-            <CountdownForm onSave={async (title, date) => { const res = await api('/countdown/create', { title, date }); setCountdowns(prev => [...prev, res.countdown].sort((a, b) => new Date(a.date) - new Date(b.date))); setShowCountdownModal(false); toast('倒数日已添加 ⏰'); }} theme={theme} />
+            <CountdownForm onSave={async (title, date) => { const res = await api('/countdown/create', { title, date }); setCountdowns(prev => sortByDateAsc([...prev, res.countdown])); setShowCountdownModal(false); toast('倒数日已添加 ⏰'); }} theme={theme} />
           </ModalWrapper>
         )}
         {showWishlistModal && (
@@ -901,11 +922,11 @@ function DashboardView({ diaryData, myRole, moods, countdowns, anniversary, them
     const target = new Date(dateStr + 'T00:00:00');
     const thisYear = new Date(today.getFullYear(), target.getMonth(), target.getDate());
     thisYear.setHours(0, 0, 0, 0);
-    const diffThis = Math.ceil((thisYear - today) / 864e5);
+    const diffThis = Math.ceil((thisYear.getTime() - today.getTime()) / 864e5);
     if (diffThis >= 0) return diffThis;
     const nextYear = new Date(today.getFullYear() + 1, target.getMonth(), target.getDate());
     nextYear.setHours(0, 0, 0, 0);
-    return Math.ceil((nextYear - today) / 864e5);
+    return Math.ceil((nextYear.getTime() - today.getTime()) / 864e5);
   };
 
   const calcAnnivDays = () => {
@@ -914,7 +935,7 @@ function DashboardView({ diaryData, myRole, moods, countdowns, anniversary, them
     today.setHours(0, 0, 0, 0);
     const start = new Date(anniversary + 'T00:00:00');
     start.setHours(0, 0, 0, 0);
-    return Math.floor((today - start) / 864e5);
+    return Math.floor((today.getTime() - start.getTime()) / 864e5);
   };
 
   const handleMoodChange = (mood) => {

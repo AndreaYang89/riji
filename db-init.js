@@ -75,7 +75,7 @@ async function init() {
       sender_id VARCHAR(36) NOT NULL,
       sender_role ENUM('girl','boy') NOT NULL,
       reason TEXT NOT NULL,
-      status ENUM('available','pending','used') DEFAULT 'available',
+      status ENUM('available','pending','used','revoked') DEFAULT 'available',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_pair (pair_id)
@@ -109,7 +109,7 @@ async function init() {
     ) ENGINE=InnoDB
   `);
 
-  console.log(`✅ 数据库 [${DB_NAME}] 初始化完成，共 6 张表`);
+  console.log(`✅ 数据库 [${DB_NAME}] 初始化完成，共 7 张表`);
   await conn.end();
 }
 
