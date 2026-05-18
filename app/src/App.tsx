@@ -188,6 +188,9 @@ export default function CoupleDiaryApp() {
           case 'countdown:created':
             setCountdowns(prev => sortByDateAsc([...prev, data]));
             break;
+          case 'countdown:deleted':
+            setCountdowns(prev => prev.filter(c => c.id !== data.id));
+            break;
           case 'mood:updated':
             setMoods(prev => ({ ...prev, [data.role]: data.mood }));
             break;
@@ -345,7 +348,6 @@ export default function CoupleDiaryApp() {
 
   const handleFabClick = () => {
     if (activeTab === 'vouchers') {
-      if (myRole === 'boy') { toast('男生没有发券的权力哦 😤'); return; }
       setShowVoucherModal(true);
     }
     else if (activeTab === 'wishlist') setShowWishlistModal(true);
@@ -418,6 +420,9 @@ export default function CoupleDiaryApp() {
           }} onSaveDiary={async (date, content) => {
             await api('/diary/save', { date, content });
             setDiaryData(prev => ({ ...prev, [date]: { ...prev[date], [myRole]: { text: content, updatedAt: Date.now() } } }));
+          }} onDeleteCountdown={async (id) => {
+            setCountdowns(prev => prev.filter(c => c.id !== id));
+            try { await api('/countdown/delete', { countdownId: id }); } catch(e) { console.error(e); }
           }} />}
           {activeTab === 'wishlist' && <WishlistView wishlist={wishlist} myRole={myRole} theme={theme} onToggle={async (id) => {
             setWishlist(prev => prev.map(w => w.id === id ? { ...w, completed: !w.completed } : w));
@@ -908,25 +913,20 @@ function VoucherForm({ onSave, theme }) {
 }
 
 // ======================== 首页仪表盘 ========================
-function DashboardView({ diaryData, myRole, moods, countdowns, anniversary, theme, onMoodChange, onComfort, onSaveDiary }) {
+function DashboardView({ diaryData, myRole, moods, countdowns, anniversary, theme, onMoodChange, onComfort, onSaveDiary, onDeleteCountdown }) {
   const [isMoodOpen, setIsMoodOpen] = useState(false);
   const partnerRole = myRole === 'girl' ? 'boy' : 'girl';
   const myMood = moods[myRole] || 'happy';
   const partnerMood = moods[partnerRole] || 'happy';
   const partnerNeedsComfort = ['emo', 'angry'].includes(partnerMood);
 
-  // 计算倒数日：如果日期已过，自动算到下一年的这个日子
+  // 计算倒数日：正数=未来还有几天，负数=已过去几天，0=就是今天
   const calcCountdownDays = (dateStr) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const target = new Date(dateStr + 'T00:00:00');
-    const thisYear = new Date(today.getFullYear(), target.getMonth(), target.getDate());
-    thisYear.setHours(0, 0, 0, 0);
-    const diffThis = Math.ceil((thisYear.getTime() - today.getTime()) / 864e5);
-    if (diffThis >= 0) return diffThis;
-    const nextYear = new Date(today.getFullYear() + 1, target.getMonth(), target.getDate());
-    nextYear.setHours(0, 0, 0, 0);
-    return Math.ceil((nextYear.getTime() - today.getTime()) / 864e5);
+    target.setHours(0, 0, 0, 0);
+    return Math.ceil((target.getTime() - today.getTime()) / 864e5);
   };
 
   const calcAnnivDays = () => {
@@ -990,10 +990,20 @@ function DashboardView({ diaryData, myRole, moods, countdowns, anniversary, them
             {countdowns.map(cd => {
               const dl = calcCountdownDays(cd.date);
               const isToday = dl === 0;
+              const isPast = dl < 0;
               return (
-                <div key={cd.id} style={{ flexShrink: 0, width: 120, padding: '10px 12px', borderRadius: 16, border: `2px solid ${isToday ? '#fbbf24' : theme.mainColorLight}`, background: isToday ? '#fffbeb' : 'white' }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 2 }}>{cd.title}</div>
-                  <div><span style={{ fontSize: 20, fontWeight: 900, color: isToday ? '#f59e0b' : theme.mainColor }}>{isToday ? '🎉' : dl}</span>{!isToday && <span style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', marginLeft: 2 }}>天后</span>}</div>
+                <div key={cd.id} style={{ position: 'relative', flexShrink: 0, width: 120, padding: '10px 12px', borderRadius: 16, border: `2px solid ${isToday ? '#fbbf24' : isPast ? '#e2e8f0' : theme.mainColorLight}`, background: isToday ? '#fffbeb' : isPast ? '#f8fafc' : 'white' }}>
+                  <button onClick={() => onDeleteCountdown(cd.id)} style={{ position: 'absolute', top: 4, right: 4, width: 20, height: 20, borderRadius: '50%', border: 'none', background: 'transparent', color: '#cbd5e1', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, lineHeight: 1 }}>×</button>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: isPast ? '#94a3b8' : '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 2, paddingRight: 12 }}>{cd.title}</div>
+                  <div>
+                    {isToday ? (
+                      <span style={{ fontSize: 20, fontWeight: 900, color: '#f59e0b' }}>🎉 今天</span>
+                    ) : isPast ? (
+                      <><span style={{ fontSize: 20, fontWeight: 900, color: '#94a3b8' }}>{Math.abs(dl)}</span><span style={{ fontSize: 9, fontWeight: 700, color: '#cbd5e1', marginLeft: 2 }}>天前</span></>
+                    ) : (
+                      <><span style={{ fontSize: 20, fontWeight: 900, color: theme.mainColor }}>{dl}</span><span style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', marginLeft: 2 }}>天后</span></>
+                    )}
+                  </div>
                 </div>
               );
             })}

@@ -621,6 +621,28 @@ app.post('/api/countdown/create', async (req, res) => {
 });
 
 /**
+ * POST /api/countdown/delete
+ */
+app.post('/api/countdown/delete', async (req, res) => {
+  try {
+    const { token, countdownId } = req.body;
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '登录已过期' });
+
+    const user = await getUserById(decoded.userId);
+    if (!user) return res.status(401).json({ error: '用户不存在' });
+    if (!user.pair_id) return res.status(403).json({ error: '未配对' });
+
+    await pool.execute('DELETE FROM countdowns WHERE id = ? AND pair_id = ?', [countdownId, user.pair_id]);
+    broadcastToPair(user.pair_id, 'countdown:deleted', { id: countdownId }, user.id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('countdown/delete error:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
+/**
  * POST /api/mood/update
  */
 app.post('/api/mood/update', async (req, res) => {
